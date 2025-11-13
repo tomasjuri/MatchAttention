@@ -3,7 +3,7 @@
 <img src='assets/logo.png' style="height:100px"></img>
 
  <a href='https://arxiv.org/abs/2510.14260'><img src='https://img.shields.io/badge/arXiv-2510.14260-b31b1b.svg'></a> &nbsp;
- <a href='https://matchattention.github.io/'><img src='https://img.shields.io/badge/Project-Page-Green'></a> &nbsp;
+ <a href='https://tingmanyan.github.io/MatchAttention/'><img src='https://img.shields.io/badge/Project-Page-Green'></a> &nbsp;
  <a href='https://huggingface.co/spaces/Tingman/MatchStereo'><img src='https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Demo-blue'></a> &nbsp;
 
 _**Tingman Yan, Tao Liu, Xilian Yang, Qunfei Zhao, Zeyang Xia**_
