@@ -6,6 +6,10 @@ import torch.nn.functional as F
 import os
 from PIL import Image
 from glob import glob
+import matplotlib
+matplotlib.use('Agg')  # Non-interactive backend
+import matplotlib.pyplot as plt
+import matplotlib.cm as cm
 
 from dataloader.stereo import transforms
 from utils.utils import InputPadder, calc_noc_mask
@@ -145,7 +149,7 @@ def run(args):
         noc_mask = noc_mask[0].detach().cpu().numpy()
         noc_mask = np.where(noc_mask, 255, 128).astype(np.uint8)
         noc_img = Image.fromarray(noc_mask)
-        noc_img.save(save_name[:-4] + '_noc.png')
+        noc_img.save(save_name[:-4] + '_noc.jpg', quality=95)
         field_up = torch.cat((field_up, torch.zeros_like(field_up[:, :1])), dim=1)
         field_up = field_up.permute(0, 2, 3, 1).contiguous() # [B, H, W, 3]
         field, field_r = field_up.chunk(2, dim=0)
@@ -157,6 +161,64 @@ def run(args):
         write_pfm(save_name, field)
         if args.save_right:
             write_pfm(save_name[:-4] + '_r.pfm', field_r)
+
+        # Save PNG visualization (same as Gradio app with colormap)
+        if stereo:
+            # Normalize disparity to 0-1 range
+            min_val = field.min()
+            max_val = field.max()
+            if max_val - min_val > 1e-6:
+                disparity_norm = (field - min_val) / (max_val - min_val)
+            else:
+                disparity_norm = np.zeros_like(field)
+            
+            # Apply turbo colormap (commonly used for disparity/depth visualization)
+            # This matches how Gradio displays 2D arrays with automatic colormap
+            colormap = plt.get_cmap('turbo')
+            disparity_colored = colormap(disparity_norm)
+            # Convert from float [0,1] to uint8 [0,255] and remove alpha channel
+            disparity_rgb = (disparity_colored[:, :, :3] * 255).astype(np.uint8)
+            disp_vis = Image.fromarray(disparity_rgb)
+            disp_vis.save(save_name[:-4] + '.jpg', quality=95)
+            
+            if args.save_right:
+                min_val_r = field_r.min()
+                max_val_r = field_r.max()
+                if max_val_r - min_val_r > 1e-6:
+                    disparity_norm_r = (field_r - min_val_r) / (max_val_r - min_val_r)
+                else:
+                    disparity_norm_r = np.zeros_like(field_r)
+                
+                # Apply turbo colormap to right disparity
+                disparity_colored_r = colormap(disparity_norm_r)
+                disparity_rgb_r = (disparity_colored_r[:, :, :3] * 255).astype(np.uint8)
+                disp_vis_r = Image.fromarray(disparity_rgb_r)
+                disp_vis_r.save(save_name[:-4] + '_r.jpg', quality=95)
+        else:
+            # Optical flow visualization (same as gradio_app.py)
+            import cv2
+            u = field[..., 0] if len(field.shape) == 3 else field[0]
+            v = field[..., 1] if len(field.shape) == 3 else field[1]
+            
+            rad = np.sqrt(u**2 + v**2)
+            rad_max = np.max(rad)
+            epsilon = 1e-8
+            
+            if rad_max > epsilon:
+                u = u / (rad_max + epsilon)
+                v = v / (rad_max + epsilon)
+            
+            h, w = u.shape
+            hsv = np.zeros((h, w, 3), dtype=np.uint8)
+            hsv[..., 1] = 255
+            
+            mag, ang = cv2.cartToPolar(u.astype(np.float32), v.astype(np.float32))
+            hsv[..., 0] = ang * 180 / np.pi / 2
+            hsv[..., 2] = cv2.normalize(mag, None, 0, 255, cv2.NORM_MINMAX)
+            
+            flow_rgb = cv2.cvtColor(hsv, cv2.COLOR_HSV2RGB)
+            flow_vis = Image.fromarray(flow_rgb)
+            flow_vis.save(save_name[:-4] + '.jpg', quality=95)
 
         if args.save_rpos:
             self_rpos, _ = self_rpos.chunk(2, dim=0)
