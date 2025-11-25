@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 
-from timm.models.layers import DropPath
+from timm.layers import DropPath
 
 from models.convformer import LayerNormWithoutBias
 from models.common import ConvGLU

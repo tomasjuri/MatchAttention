@@ -3,9 +3,14 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from timm.models.layers import trunc_normal_, DropPath
-from timm.models.registry import register_model
-from timm.models.layers.helpers import to_2tuple
+from timm.layers import trunc_normal_, DropPath
+from timm.models import register_model
+
+def to_2tuple(x):
+    """Convert value to a tuple of length 2."""
+    if isinstance(x, (list, tuple)):
+        return tuple(x[:2])
+    return (x, x)
 class LayerNormGeneral(nn.Module):
     r""" General LayerNorm for different situations.
 
