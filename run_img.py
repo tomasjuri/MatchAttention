@@ -10,6 +10,7 @@ import matplotlib
 matplotlib.use('Agg')  # Non-interactive backend
 import matplotlib.pyplot as plt
 import matplotlib.cm as cm
+import time
 
 from dataloader.stereo import transforms
 from utils.utils import InputPadder, calc_noc_mask
@@ -17,6 +18,171 @@ from utils.file_io import write_pfm
 from models.match_stereo import MatchStereo
 
 torch.backends.cudnn.benchmark = True
+
+
+def is_onnx_model(checkpoint_path):
+    """Check if the checkpoint is an ONNX model based on file extension."""
+    return checkpoint_path.lower().endswith('.onnx')
+
+
+def run_onnx(args):
+    """Run inference using ONNX Runtime"""
+    try:
+        import onnxruntime as ort
+    except ImportError:
+        raise ImportError("onnxruntime is required for ONNX inference. Install with: pip install onnxruntime")
+    
+    stereo = (args.mode == 'stereo')
+    if not stereo:
+        raise NotImplementedError("ONNX inference currently only supports stereo mode")
+    
+    val_transform_list = [transforms.Resize(scale_x=args.scale, scale_y=args.scale), 
+                          transforms.ToTensor(no_normalize=True)]
+    val_transform = transforms.Compose(val_transform_list)
+
+    if not os.path.exists(args.output_path):
+        os.makedirs(args.output_path)
+
+    # Setup ONNX Runtime session
+    providers = ['CPUExecutionProvider']
+    if args.device_id >= 0:
+        try:
+            # Try CUDA provider if GPU requested
+            providers = ['CUDAExecutionProvider', 'CPUExecutionProvider']
+        except:
+            print("CUDA provider not available, falling back to CPU")
+            providers = ['CPUExecutionProvider']
+    
+    print(f"Loading ONNX model from: {args.checkpoint_path}")
+    session_options = ort.SessionOptions()
+    session_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+    session = ort.InferenceSession(args.checkpoint_path, session_options, providers=providers)
+    
+    # Get input/output names
+    input_names = [inp.name for inp in session.get_inputs()]
+    output_names = [out.name for out in session.get_outputs()]
+    print(f"ONNX Inputs: {input_names}")
+    print(f"ONNX Outputs: {output_names}")
+
+    # Gather image paths
+    if args.middv3_dir is not None:
+        left_names = sorted(glob(args.middv3_dir + '/*/*/im0.png'))
+        right_names = sorted(glob(args.middv3_dir + '/*/*/im1.png'))
+    elif args.eth3d_dir is not None:
+        left_names = sorted(glob(args.eth3d_dir + '/*/*/im0.png'))
+        right_names = sorted(glob(args.eth3d_dir + '/*/*/im1.png'))
+    else:
+        left_names = sorted(glob(args.img0_dir + '/*.png') + glob(args.img0_dir + '/*.jpg') + glob(args.img0_dir + '/*.bmp'))
+        right_names = sorted(glob(args.img1_dir + '/*.png') + glob(args.img1_dir + '/*.jpg') + glob(args.img1_dir + '/*.bmp'))
+    assert len(left_names) == len(right_names)
+
+    num_samples = len(left_names)
+    print(f'{num_samples} test samples found')
+
+    for i in range(num_samples):
+        left = np.array(Image.open(left_names[i]).convert('RGB')).astype(np.float32)
+        right = np.array(Image.open(right_names[i]).convert('RGB')).astype(np.float32)
+
+        sample = {'left': left, 'right': right}
+        sample = val_transform(sample)
+        
+        # Convert to numpy for ONNX (keep in [0, 255] range as expected by ONNX model)
+        left_tensor = sample['left'].unsqueeze(0)  # [1, 3, H, W]
+        right_tensor = sample['right'].unsqueeze(0)  # [1, 3, H, W]
+        
+        ori_size = left_tensor.shape[-2:]
+        
+        # Pad to be divisible by 32
+        if args.inference_size is None:
+            padder = InputPadder(left_tensor.shape, padding_factor=32)
+            left_tensor, right_tensor = padder.pad(left_tensor, right_tensor)
+        else:
+            left_tensor = F.interpolate(left_tensor, size=args.inference_size, mode='bilinear', align_corners=True)
+            right_tensor = F.interpolate(right_tensor, size=args.inference_size, mode='bilinear', align_corners=True)
+        
+        # Convert to numpy arrays for ONNX Runtime
+        left_np = left_tensor.numpy().astype(np.float32)
+        right_np = right_tensor.numpy().astype(np.float32)
+
+        print(f"Resolution: {left_np.shape}")
+        
+        # Run ONNX inference
+        if args.test_inference_time:
+            # Warmup
+            for _ in range(5):
+                _ = session.run(output_names, {input_names[0]: left_np, input_names[1]: right_np})
+            
+            # Benchmark
+            times = []
+            for _ in range(5):
+                start = time.perf_counter()
+                outputs = session.run(output_names, {input_names[0]: left_np, input_names[1]: right_np})
+                end = time.perf_counter()
+                times.append((end - start) * 1000)
+            
+            inference_time = np.mean(times)
+            print(f"Inference Time (ONNX) on {left_names[i]}: {inference_time:.6f} ms")
+            disparity = outputs[0]
+        else:
+            outputs = session.run(output_names, {input_names[0]: left_np, input_names[1]: right_np})
+            disparity = outputs[0]  # [B, H, W]
+        
+        # Convert to torch tensor for post-processing
+        field = torch.from_numpy(disparity)  # [B, H, W]
+        
+        # Unpad or rescale
+        if args.inference_size is None:
+            # Unpad - add channel dim for unpadding then remove
+            field = field.unsqueeze(1)  # [B, 1, H, W]
+            field = padder.unpad(field)
+            field = field.squeeze(1)  # [B, H, W]
+        else:
+            field = field.unsqueeze(1)  # [B, 1, H, W]
+            field = F.interpolate(field, size=ori_size, mode='bilinear', align_corners=True)
+            field = field * (ori_size[1] / float(args.inference_size[1]))
+            field = field.squeeze(1)  # [B, H, W]
+        
+        field = field[0].numpy()  # [H, W]
+        
+        # Save outputs
+        if args.middv3_dir is not None:
+            save_name = left_names[i].replace('/MiddEval3', '/MiddEval3_results').replace('/im0.png', '/disp0MatchStereo.pfm')
+        elif args.eth3d_dir is not None:
+            parts = list(Path(left_names[i]).parts)
+            parts[1] = "ETH3D_results"
+            parts[2] = "low_res_two_view"
+            save_name = str(Path(*parts[:3]) / f"{parts[3]}.pfm")
+        else:
+            save_name = os.path.join(args.output_path, os.path.basename(left_names[i])[:-4] + f'_{args.mode}.pfm')
+        os.makedirs(os.path.dirname(save_name), exist_ok=True)
+
+        write_pfm(save_name, field)
+
+        # Save PNG visualization with colormap
+        min_val = field.min()
+        max_val = field.max()
+        if max_val - min_val > 1e-6:
+            disparity_norm = (field - min_val) / (max_val - min_val)
+        else:
+            disparity_norm = np.zeros_like(field)
+        
+        colormap = plt.get_cmap('turbo')
+        disparity_colored = colormap(disparity_norm)
+        disparity_rgb = (disparity_colored[:, :, :3] * 255).astype(np.uint8)
+        disp_vis = Image.fromarray(disparity_rgb)
+        disp_vis.save(save_name[:-4] + '.jpg', quality=95)
+
+        if args.test_inference_time:
+            if args.middv3_dir is not None:
+                save_time_name = save_name.replace('/disp0MatchStereo.pfm', '/timeMatchStereo.txt')
+                with open(save_time_name, 'w') as f:
+                    f.write(str(inference_time / 1000))
+            elif args.eth3d_dir is not None:
+                save_time_name = save_name.replace('.pfm', '.txt')
+                with open(save_time_name, 'w') as f:
+                    f.write(str(f"runtime {inference_time / 1000}"))
+
+    print("ONNX Inference done.")
 
 def run_frame(model, left, right, stereo, low_res_init, factor=2.):
     if low_res_init: # downsample to 1/2, can also be 1/4
@@ -241,16 +407,17 @@ def run(args):
 def main():
     """Run MatchStereo/MatchFlow inference example"""
     parser = argparse.ArgumentParser(
-        description="Inference scripts of MatchStereo/MatchFlow with PyTorch models."
+        description="Inference scripts of MatchStereo/MatchFlow with PyTorch or ONNX models."
     )
-    parser.add_argument('--checkpoint_path', required=True, type=str, help='Path to MatchStereo/MatchFlow checkpoint')
+    parser.add_argument('--checkpoint_path', required=True, type=str, 
+                        help='Path to MatchStereo/MatchFlow checkpoint (.pth for PyTorch, .onnx for ONNX)')
     parser.add_argument('--mode', choices=['stereo', 'flow'], default='stereo', help='Support stereo and flow tasks')
     parser.add_argument('--img0_dir', default=None, type=str, help='Reference view')
     parser.add_argument('--img1_dir', default=None, type=str, help='Target view')
     parser.add_argument('--middv3_dir', default=None, type=str)
     parser.add_argument('--eth3d_dir', default=None, type=str)
     parser.add_argument('--output_path', default='outputs', type=str)
-    parser.add_argument('--device_id', default=0, type=int, help='Devide id of gpu, -1 for cpu')
+    parser.add_argument('--device_id', default=0, type=int, help='Device id of gpu, -1 for cpu')
     parser.add_argument('--scale', default=1, type=float)
     parser.add_argument('--inference_size', default=None, type=int, nargs='+', help='Shall be divisible by 32')
     parser.add_argument('--mat_impl', choices=['pytorch', 'cuda'], default='pytorch', help='MatchAttention implementation')
@@ -263,7 +430,14 @@ def main():
     parser.add_argument('--low_res_init', action='store_true', default=False, help='Low-resolution init, use this when image is of high-resolution (>=2K)')
 
     args = parser.parse_args()
-    run(args)
+    
+    # Check model format and run appropriate inference
+    if is_onnx_model(args.checkpoint_path):
+        print("Detected ONNX model format, using ONNX Runtime for inference...")
+        run_onnx(args)
+    else:
+        print("Detected PyTorch model format, using PyTorch for inference...")
+        run(args)
 
 if __name__ == "__main__":
     main()
