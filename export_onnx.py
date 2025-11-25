@@ -209,7 +209,16 @@ def quantize_onnx(input_path, output_path, quantize_type='int8'):
             
             print(f"  Converting to FP16...")
             model = onnx.load(input_path)
-            model_fp16 = float16.convert_float_to_float16(model)
+            
+            # Use more conservative FP16 conversion with op_block_list to avoid type mismatches
+            # Some ops like ConstantOfShape, Shape, etc. should remain FP32
+            op_block_list = ['ConstantOfShape', 'Shape', 'NonZero', 'Gather', 'Scatter']
+            model_fp16 = float16.convert_float_to_float16(
+                model,
+                op_block_list=op_block_list,
+                min_positive_val=1e-7,
+                max_finite_val=1e4
+            )
             onnx.save(model_fp16, output_path)
             print(f"  FP16 model saved to: {output_path}")
             return True

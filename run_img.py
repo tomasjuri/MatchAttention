@@ -25,6 +25,11 @@ def is_onnx_model(checkpoint_path):
     return checkpoint_path.lower().endswith('.onnx')
 
 
+def is_ncnn_model(checkpoint_path):
+    """Check if the checkpoint is an NCNN model based on file extension."""
+    return checkpoint_path.lower().endswith('.param') or checkpoint_path.lower().endswith('.ncnn.param')
+
+
 def run_onnx(args):
     """Run inference using ONNX Runtime"""
     try:
@@ -54,9 +59,28 @@ def run_onnx(args):
             providers = ['CPUExecutionProvider']
     
     print(f"Loading ONNX model from: {args.checkpoint_path}")
+    
+    # Check if this is an FP16 model
+    is_fp16_model = '_fp16.onnx' in args.checkpoint_path.lower()
+    
     session_options = ort.SessionOptions()
     session_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-    session = ort.InferenceSession(args.checkpoint_path, session_options, providers=providers)
+    
+    # For FP16 models on CPU, we may need to disable some optimizations
+    # or use a different approach since CPUExecutionProvider may not fully support FP16
+    if is_fp16_model and 'CPUExecutionProvider' in providers:
+        print("  Warning: FP16 model detected. CPUExecutionProvider may have limited FP16 support.")
+        print("  If you encounter errors, try using the FP32 or INT8 model instead.")
+        # Try with reduced optimizations for FP16 on CPU
+        session_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_BASIC
+    
+    try:
+        session = ort.InferenceSession(args.checkpoint_path, session_options, providers=providers)
+    except Exception as e:
+        if is_fp16_model:
+            print(f"  Error loading FP16 model: {e}")
+            print("  Suggestion: Use FP32 model (without _fp16 suffix) or INT8 model for better CPU compatibility")
+        raise
     
     # Get input/output names
     input_names = [inp.name for inp in session.get_inputs()]
@@ -106,7 +130,7 @@ def run_onnx(args):
 
         print(f"Resolution: {left_np.shape}")
         
-        # Run ONNX inference
+        # Run ONNX inference with timing
         if args.test_inference_time:
             # Warmup
             for _ in range(5):
@@ -124,7 +148,13 @@ def run_onnx(args):
             print(f"Inference Time (ONNX) on {left_names[i]}: {inference_time:.6f} ms")
             disparity = outputs[0]
         else:
+            # Single inference with timing
             outputs = session.run(output_names, {input_names[0]: left_np, input_names[1]: right_np})
+            start = time.perf_counter()
+            outputs = session.run(output_names, {input_names[0]: left_np, input_names[1]: right_np})
+            end = time.perf_counter()
+            inference_time = (end - start) * 1000  # Convert to milliseconds
+            print(f"Inference Time (ONNX) on {left_names[i]}: {inference_time:.3f} ms")
             disparity = outputs[0]  # [B, H, W]
         
         # Convert to torch tensor for post-processing
@@ -183,6 +213,229 @@ def run_onnx(args):
                     f.write(str(f"runtime {inference_time / 1000}"))
 
     print("ONNX Inference done.")
+
+
+def run_ncnn(args):
+    """Run inference using NCNN"""
+    try:
+        import ncnn
+    except ImportError:
+        raise ImportError("ncnn is required for NCNN inference. Install with: pip install ncnn")
+    
+    stereo = (args.mode == 'stereo')
+    if not stereo:
+        raise NotImplementedError("NCNN inference currently only supports stereo mode")
+    
+    val_transform_list = [transforms.Resize(scale_x=args.scale, scale_y=args.scale), 
+                          transforms.ToTensor(no_normalize=True)]
+    val_transform = transforms.Compose(val_transform_list)
+
+    if not os.path.exists(args.output_path):
+        os.makedirs(args.output_path)
+
+    # Determine param and bin file paths
+    param_path = args.checkpoint_path
+    if param_path.endswith('.ncnn.param'):
+        bin_path = param_path.replace('.ncnn.param', '.ncnn.bin')
+    else:
+        bin_path = param_path.replace('.param', '.bin')
+    
+    if not os.path.exists(bin_path):
+        raise FileNotFoundError(f"NCNN bin file not found: {bin_path}")
+    
+    print(f"Loading NCNN model from:")
+    print(f"  Param: {param_path}")
+    print(f"  Bin: {bin_path}")
+    
+    # Create NCNN net
+    net = ncnn.Net()
+    
+    # Enable Vulkan GPU if available and requested
+    if args.device_id >= 0:
+        try:
+            net.opt.use_vulkan_compute = True
+            print("  Using Vulkan GPU acceleration")
+        except Exception as e:
+            print(f"  Vulkan not available: {e}, using CPU")
+            net.opt.use_vulkan_compute = False
+    else:
+        net.opt.use_vulkan_compute = False
+        print("  Using CPU")
+    
+    # Load model
+    net.load_param(param_path)
+    net.load_model(bin_path)
+    
+    # Get input/output names from param file
+    input_names = []
+    output_names = []
+    with open(param_path, 'r') as f:
+        lines = f.readlines()
+        for line in lines[2:]:  # Skip magic number and layer count
+            parts = line.strip().split()
+            if len(parts) >= 3:
+                layer_type = parts[0]
+                if layer_type == 'Input':
+                    # Input layer - get the output blob name
+                    if len(parts) > 4:
+                        input_names.append(parts[4])
+                # Try to find output layers (usually the last ones)
+    
+    print(f"NCNN model loaded successfully")
+
+    # Gather image paths
+    if args.middv3_dir is not None:
+        left_names = sorted(glob(args.middv3_dir + '/*/*/im0.png'))
+        right_names = sorted(glob(args.middv3_dir + '/*/*/im1.png'))
+    elif args.eth3d_dir is not None:
+        left_names = sorted(glob(args.eth3d_dir + '/*/*/im0.png'))
+        right_names = sorted(glob(args.eth3d_dir + '/*/*/im1.png'))
+    else:
+        left_names = sorted(glob(args.img0_dir + '/*.png') + glob(args.img0_dir + '/*.jpg') + glob(args.img0_dir + '/*.bmp'))
+        right_names = sorted(glob(args.img1_dir + '/*.png') + glob(args.img1_dir + '/*.jpg') + glob(args.img1_dir + '/*.bmp'))
+    assert len(left_names) == len(right_names)
+
+    num_samples = len(left_names)
+    print(f'{num_samples} test samples found')
+
+    for i in range(num_samples):
+        left = np.array(Image.open(left_names[i]).convert('RGB')).astype(np.float32)
+        right = np.array(Image.open(right_names[i]).convert('RGB')).astype(np.float32)
+
+        sample = {'left': left, 'right': right}
+        sample = val_transform(sample)
+        
+        # Convert to numpy for NCNN (keep in [0, 255] range as expected by model)
+        left_tensor = sample['left'].unsqueeze(0)  # [1, 3, H, W]
+        right_tensor = sample['right'].unsqueeze(0)  # [1, 3, H, W]
+        
+        ori_size = left_tensor.shape[-2:]
+        
+        # Pad to be divisible by 32
+        if args.inference_size is None:
+            padder = InputPadder(left_tensor.shape, padding_factor=32)
+            left_tensor, right_tensor = padder.pad(left_tensor, right_tensor)
+        else:
+            left_tensor = F.interpolate(left_tensor, size=args.inference_size, mode='bilinear', align_corners=True)
+            right_tensor = F.interpolate(right_tensor, size=args.inference_size, mode='bilinear', align_corners=True)
+        
+        # Convert to numpy arrays for NCNN - shape [1, C, H, W] -> [C, H, W]
+        left_np = left_tensor[0].numpy().astype(np.float32)  # [C, H, W]
+        right_np = right_tensor[0].numpy().astype(np.float32)  # [C, H, W]
+        
+        # Create NCNN Mat from numpy array (CHW format)
+        # NCNN expects HWC or can use from_pixels for image data
+        # For CHW float data, we create Mat directly
+        c, h, w = left_np.shape
+        
+        # Create ncnn.Mat from CHW numpy array
+        left_mat = ncnn.Mat(left_np)
+        right_mat = ncnn.Mat(right_np)
+
+        print(f"Resolution: ({1}, {c}, {h}, {w})")
+        
+        # Run NCNN inference with timing
+        if args.test_inference_time:
+            # Warmup
+            for _ in range(5):
+                ex = net.create_extractor()
+                ex.input("left", left_mat)
+                ex.input("right", right_mat)
+                _, _ = ex.extract("disparity")
+            
+            # Benchmark
+            times = []
+            for _ in range(5):
+                start = time.perf_counter()
+                ex = net.create_extractor()
+                ex.input("left", left_mat)
+                ex.input("right", right_mat)
+                ret, mat_out = ex.extract("disparity")
+                end = time.perf_counter()
+                times.append((end - start) * 1000)
+            
+            inference_time = np.mean(times)
+            print(f"Inference Time (NCNN) on {left_names[i]}: {inference_time:.6f} ms")
+        else:
+            # Single inference with timing
+            ex = net.create_extractor()
+            ex.input("left", left_mat)
+            ex.input("right", right_mat)
+            
+            start = time.perf_counter()
+            ret, mat_out = ex.extract("disparity")
+            end = time.perf_counter()
+            inference_time = (end - start) * 1000  # Convert to milliseconds
+            print(f"Inference Time (NCNN) on {left_names[i]}: {inference_time:.3f} ms")
+        
+        # Convert NCNN Mat to numpy - mat_out should be [H, W] for disparity
+        disparity = np.array(mat_out)
+        
+        # Handle different output shapes
+        if len(disparity.shape) == 3:
+            # Output is [C, H, W] or [1, H, W]
+            if disparity.shape[0] == 1:
+                disparity = disparity[0]  # [H, W]
+            else:
+                disparity = disparity[0]  # Take first channel
+        
+        # Convert to torch tensor for post-processing
+        field = torch.from_numpy(disparity).unsqueeze(0)  # [1, H, W]
+        
+        # Unpad or rescale
+        if args.inference_size is None:
+            # Unpad - add channel dim for unpadding then remove
+            field = field.unsqueeze(1)  # [1, 1, H, W]
+            field = padder.unpad(field)
+            field = field.squeeze(1)  # [1, H, W]
+        else:
+            field = field.unsqueeze(1)  # [1, 1, H, W]
+            field = F.interpolate(field, size=ori_size, mode='bilinear', align_corners=True)
+            field = field * (ori_size[1] / float(args.inference_size[1]))
+            field = field.squeeze(1)  # [1, H, W]
+        
+        field = field[0].numpy()  # [H, W]
+        
+        # Save outputs
+        if args.middv3_dir is not None:
+            save_name = left_names[i].replace('/MiddEval3', '/MiddEval3_results').replace('/im0.png', '/disp0MatchStereo.pfm')
+        elif args.eth3d_dir is not None:
+            parts = list(Path(left_names[i]).parts)
+            parts[1] = "ETH3D_results"
+            parts[2] = "low_res_two_view"
+            save_name = str(Path(*parts[:3]) / f"{parts[3]}.pfm")
+        else:
+            save_name = os.path.join(args.output_path, os.path.basename(left_names[i])[:-4] + f'_{args.mode}.pfm')
+        os.makedirs(os.path.dirname(save_name), exist_ok=True)
+
+        write_pfm(save_name, field)
+
+        # Save PNG visualization with colormap
+        min_val = field.min()
+        max_val = field.max()
+        if max_val - min_val > 1e-6:
+            disparity_norm = (field - min_val) / (max_val - min_val)
+        else:
+            disparity_norm = np.zeros_like(field)
+        
+        colormap = plt.get_cmap('turbo')
+        disparity_colored = colormap(disparity_norm)
+        disparity_rgb = (disparity_colored[:, :, :3] * 255).astype(np.uint8)
+        disp_vis = Image.fromarray(disparity_rgb)
+        disp_vis.save(save_name[:-4] + '.jpg', quality=95)
+
+        if args.test_inference_time:
+            if args.middv3_dir is not None:
+                save_time_name = save_name.replace('/disp0MatchStereo.pfm', '/timeMatchStereo.txt')
+                with open(save_time_name, 'w') as f:
+                    f.write(str(inference_time / 1000))
+            elif args.eth3d_dir is not None:
+                save_time_name = save_name.replace('.pfm', '.txt')
+                with open(save_time_name, 'w') as f:
+                    f.write(str(f"runtime {inference_time / 1000}"))
+
+    print("NCNN Inference done.")
+
 
 def run_frame(model, left, right, stereo, low_res_init, factor=2.):
     if low_res_init: # downsample to 1/2, can also be 1/4
@@ -282,7 +535,24 @@ def run(args):
                 print(f"Inference Time (GPU) on {left_names[i]}: {inference_time:.6f} ms")
 
             else:
-                results_dict = run_frame(model, left, right, stereo, args.low_res_init)
+                # Single inference with timing
+                if torch.cuda.is_available() and args.device_id >= 0:
+                    # GPU timing
+                    start_event = torch.cuda.Event(enable_timing=True)
+                    end_event = torch.cuda.Event(enable_timing=True)
+                    start_event.record()
+                    results_dict = run_frame(model, left, right, stereo, args.low_res_init)
+                    end_event.record()
+                    end_event.synchronize()
+                    inference_time = start_event.elapsed_time(end_event)
+                    print(f"Inference Time (GPU) on {left_names[i]}: {inference_time:.3f} ms")
+                else:
+                    # CPU timing
+                    start = time.perf_counter()
+                    results_dict = run_frame(model, left, right, stereo, args.low_res_init)
+                    end = time.perf_counter()
+                    inference_time = (end - start) * 1000  # Convert to milliseconds
+                    print(f"Inference Time (CPU) on {left_names[i]}: {inference_time:.3f} ms")
 
             field_up = results_dict['field_up'].permute(0, 3, 1, 2).float().contiguous()
             self_rpos = results_dict['self_rpos'].permute(0, 3, 1, 2).float().contiguous()
@@ -407,10 +677,10 @@ def run(args):
 def main():
     """Run MatchStereo/MatchFlow inference example"""
     parser = argparse.ArgumentParser(
-        description="Inference scripts of MatchStereo/MatchFlow with PyTorch or ONNX models."
+        description="Inference scripts of MatchStereo/MatchFlow with PyTorch, ONNX, or NCNN models."
     )
     parser.add_argument('--checkpoint_path', required=True, type=str, 
-                        help='Path to MatchStereo/MatchFlow checkpoint (.pth for PyTorch, .onnx for ONNX)')
+                        help='Path to MatchStereo/MatchFlow checkpoint (.pth for PyTorch, .onnx for ONNX, .param for NCNN)')
     parser.add_argument('--mode', choices=['stereo', 'flow'], default='stereo', help='Support stereo and flow tasks')
     parser.add_argument('--img0_dir', default=None, type=str, help='Reference view')
     parser.add_argument('--img1_dir', default=None, type=str, help='Target view')
@@ -432,7 +702,10 @@ def main():
     args = parser.parse_args()
     
     # Check model format and run appropriate inference
-    if is_onnx_model(args.checkpoint_path):
+    if is_ncnn_model(args.checkpoint_path):
+        print("Detected NCNN model format, using NCNN for inference...")
+        run_ncnn(args)
+    elif is_onnx_model(args.checkpoint_path):
         print("Detected ONNX model format, using ONNX Runtime for inference...")
         run_onnx(args)
     else:
