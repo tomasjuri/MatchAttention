@@ -4,20 +4,23 @@
 from PIL import Image
 import os
 
-# Input paths
-IMG0_PATH = "/Users/tomasjurica/projects/FingernailCalibration/StereoVision/MatchAttention/input_data/im0.jpg"
-IMG1_PATH = "/Users/tomasjurica/projects/FingernailCalibration/StereoVision/MatchAttention/input_data/im1.jpg"
+# Input paths (load from input_data_full)
+INPUT_DIR = "/home/tomasjurica/projects/MatchAttention/input_data_full"
+IMG0_PATH = os.path.join(INPUT_DIR, "im0.jpg")
+IMG1_PATH = os.path.join(INPUT_DIR, "im1.jpg")
 
 # Crop parameters: left, top, width, height
 CROP_LEFT = 100
 CROP_TOP = 150
-CROP_WIDTH = 400
-CROP_HEIGHT = 400
+CROP_WIDTH = 416
+CROP_HEIGHT = 416
 
-# Output paths
-OUTPUT_DIR = "/Users/tomasjurica/projects/FingernailCalibration/StereoVision/MatchAttention/input_data"
-OUTPUT_IMG0 = os.path.join(OUTPUT_DIR, "im0_cropped.jpg")
-OUTPUT_IMG1 = os.path.join(OUTPUT_DIR, "im1_cropped.jpg")
+# Output paths (save to input_data)
+OUTPUT_DIR = "/home/tomasjurica/projects/MatchAttention/input_data"
+OUTPUT_LEFT_DIR = os.path.join(OUTPUT_DIR, "left")
+OUTPUT_RIGHT_DIR = os.path.join(OUTPUT_DIR, "right")
+OUTPUT_IMG0 = os.path.join(OUTPUT_LEFT_DIR, "im0_cropped.jpg")
+OUTPUT_IMG1 = os.path.join(OUTPUT_RIGHT_DIR, "im1_cropped.jpg")
 
 def crop_image(input_path, output_path, left, top, width, height):
     """Crop an image and save it"""
@@ -36,6 +39,10 @@ def crop_image(input_path, output_path, left, top, width, height):
     print(f"  Crop region: ({left}, {top}) to ({right}, {bottom}), size: {width}x{height}")
 
 if __name__ == "__main__":
+    # Create output directories if they don't exist
+    os.makedirs(OUTPUT_LEFT_DIR, exist_ok=True)
+    os.makedirs(OUTPUT_RIGHT_DIR, exist_ok=True)
+    
     # Crop both images
     crop_image(IMG0_PATH, OUTPUT_IMG0, CROP_LEFT, CROP_TOP, CROP_WIDTH, CROP_HEIGHT)
     crop_image(IMG1_PATH, OUTPUT_IMG1, CROP_LEFT, CROP_TOP, CROP_WIDTH, CROP_HEIGHT)
